@@ -2,9 +2,17 @@
 
 import os, sys, math, datetime, gc, time
 import threading, multiprocessing
-from optparse import OptionParser
+import argparse
 import subprocess
 import gzip
+import csv
+import re
+
+from collections import Counter
+
+INSERT_RE = re.compile('\+[0-9]+[ACGTNacgtn]+')
+
+#Edited 08-06-2017 by Christian Schudoma to make usable
 
 #Edited 11-24-2015 by Tyson Howell to output to stdout so that it can be compressed or piped. Also added an option to provide an input file containing the output of `wc -l` run on the input (recommended to generate this when writing out the mpileup in the previous step) to reduce I/O. Intermediate files are also compressed.
 
@@ -12,15 +20,15 @@ import gzip
 #Meric Lieberman, 2012
 # This work is the property of UC Davis Genome Center - Comai Lab
 
-# Use at your own risk. 
+# Use at your own risk.
 # We cannot provide support.
-# All information obtained/inferred with this script is without any 
-# implied warranty of fitness for any purpose or use whatsoever. 
+# All information obtained/inferred with this script is without any
+# implied warranty of fitness for any purpose or use whatsoever.
 #------------------------------------------------------------------------------
 
 #Part 2: mpileup-parser.py
 #
-#This program parses a mpileup file to a simplified format to be used with our MAPS 
+#This program parses a mpileup file to a simplified format to be used with our MAPS
 #mutation and genotyping package.
 #
 #INPUT:
@@ -40,19 +48,6 @@ import gzip
 #2. OPTIONAL:
 #-t or --thread, Number of cores to be used while processing. [1]
 
-start = time.time()
-
-usage = "\nUSAGE: %prog [-t #threads] -f mpileup_file.txt"
-parser = OptionParser(usage=usage)
-parser.add_option("-t", "--thread", dest="threads", default="1", help="How many threads to use during processing. (DEFAULT == 1")
-parser.add_option("-f", "--mpileup_file", dest="file", help="Input mpileup file file.")
-parser.add_option("-l", "--length", dest="in_len", help="File containing length in lines of input mpileup")
-(opt, args) = parser.parse_args()
-
-numThreads = int(opt.threads)
-path = "/share/scripts/"
-path = "./"
-
 #split file into chunks
 def splitter(l, n):
     i = 0
@@ -62,195 +57,116 @@ def splitter(l, n):
         i += n
         chunk = l[i:i+n]
 
-#text formatting
-def form(flo):
-   return str(flo).split('.')[0]+'.'+str(flo).split('.')[1][:2]
-#accepted base
-def test(s):
-   valid = ['a','t','c','g','A','T','C','G','.',',','*','n','N']
-   test = 0
-   for x in valid:
-      if x+'+' in s:
-         test = 1
-         break
-   if test == 1:  
-      return 1
-   else:
-      return 0
+# this is translated from original script,
+# in which
+#  - deletion handling is missing
+#  - insertions are only counted once
+def scanChanges(changes, validChars):
+    c_changes, c_inserts = Counter(), Counter()
+    p = 0
+    last = None
+    while p < len(changes):
+        if changes[p] in validChars:
+            c_changes[changes[p].upper()] += 1
+            last = changes[p].upper()
+        elif changes[p] == "^":
+            p += 1
+        elif changes[p] == '+' or changes[p] == '-':
+            c_changes[last] -= 1
+            inslen = re.match('[0-9]+', changes[p + 1:]).group()
+            p += int(inslen) + len(inslen)
+            if changes[p] == '+':
+                c_inserts['.{}'.format(changes[p + 1:p + 1 + int(inslen) + len(inslen)]).upper()] += 1
+        p += 1
+    return c_changes, c_inserts
+
+
 
 #parse one pileup line
 #based on parsing script from Joeseph Fass
 
 class MyThread (multiprocessing.Process):
 
-   def __init__ (self, filen, res, startpos, endpos):
-      self.filen = filen
-      self.res = res
-      self.startpos = startpos
-      self.endpos = endpos
-      multiprocessing.Process.__init__ (self)
-      
-   def run (self):
-      counter = 1
-      ctgood = 0
-      sys.stderr.write("%s %s\n" % (self.startpos, self.endpos))
-      all = self.endpos - self.startpos
-      ot = gzip.open("temp-parse-"+str(self.res)+".txt",'w')
-      f = gzip.open(self.filen)
-      #print "\nSkipping %s" % f.readline()
-      f.readline()
-      for l in f:
-         #print "l in f is %s" % l.strip()
-         if counter < self.startpos or counter > self.endpos:
-            counter +=1
-            continue
-            
-         if ctgood % 100008 == 0:
-            sys.stderr.write("%s %s/%s\n" % (self.res, ctgood,all))
-         ctgood +=1
-         counter +=1
-         #doOneLine(self.lines[k], ot) 
-         #y = self.lines[c]
-         ######
-         #def doOneLine(y, fh):
-         k = l[:-1].split('\t')
-         #print "k is %s\n" % k
-         refseq = k[0]
-         position = k[1]
-         refbase = k[2]
-         div = list(splitter(k,3))
-         result = div[0]
-         #for a lib
-         for sub in div[1:]:
-            depth = sub[0]
-            changes = sub[1]
-            qualities = sub[2]
-            try:
-               mean_SQ = form(sum(map(lambda x: ord(x)-33, list(qualities)))/float(len(qualities)))
-            except ZeroDivisionError:
-               mean_SQ = "0.0"
-            if float(mean_SQ) < 20.00:
-               result += ['.','.','.','.']
-               continue
-            else:  
-               inserts = {}
-               quals = {'a':0,'A':0,'c':0,'C':0,'g':0,'G':0,'t':0,'T':0,'.':0,',':0,'*':0}
-               valid = ['a','A','c','C','g','G','t','T','.',',','*']
-            
-               #depth = t[3]
-               #changes = t[4]
-               #qualities = t[5][:]
-               #mappingqual = t[6][:-1]
-               count = 0
-               index = 0
-               x = 0
-               temp = sub[1]
-               temp = temp.replace('^+','')  
-               while test(temp) == 1:
-                  pin = temp.index('+')
-                  numb = ""
-                  i = 0
-                  while 1:
-                     if temp[pin+1+i].isdigit():
-                        numb+= temp[pin+1+i]
-                        i+=1
-                     else:
-                        break    
-                  
-                  #take = int(temp[pin+1])
-                  take = int(numb)
-                  #print take
-                  total = temp[pin-1:pin+2+take]
-                  cleantotal = '.'+str.upper(total[1:])
-                  try:
-                     inserts[cleantotal] +=1
-                  except:
-                     inserts[cleantotal] = 1
-                     
-                  temp = temp.replace(total, '')
-                  sub[1] = sub[1].replace(total, '')
-               if '+' in sub[1]:
-                  pin = sub[1].index('+')
-                  if sub[1][pin-1] != '^':
-                     sys.stderr.write("error, +/- found\n")
-                     sys.stderr.write("%s\n" % sub[1])
-            
-               while 1: 
-                  if x >= len(sub[1]):
-                     break
-                  elif sub[1][x] in valid:
-                     quals[sub[1][x]] +=1
-                     index+=1
-                  elif sub[1][x] == "^":
-                     x+=1
-                  elif sub[1][x] == '+' or sub[1][x] == '-':  
-                     temp = ""
-                     i = 0
-                     while 1:
-                        if sub[1][x+1+i].isdigit():
-                           temp+= sub[1][x+1+i]
-                           i+=1
-                        else:
-                           break
-                     x+= int(temp)+len(temp)
-            
-                  x+=1
-            
-               total_HQ = sum(quals.values())
-               Aa_HQ = quals['A']+quals['a']
-               Tt_HQ = quals['T']+quals['t']
-               Cc_HQ = quals['C']+quals['c']
-               Gg_HQ = quals['G']+quals['g']
-               match_HQ = quals['.']+quals[',']
-               dels = quals['*']
-               
-         
-               try:
-                  if len(inserts) >0:
-                     #print mean_SQ, qualities
-                     inlist =  map(lambda x: [x, inserts[x]], inserts.keys())
-                     inlist.sort(lambda x, y: cmp(y[1], x[1]))
-                     inname = inlist[0][0]
-                     incount = inlist[0][1]  
-                     inper = incount/float(incount + total_HQ)*100
-                     delper = dels/float(incount + total_HQ)*100
-                     oin = str(sum(map(lambda x: x[1], inlist)))
-                     total_HQ += int(oin)
-                     scan = [[inname,inper]]
-                  else:
-                     inname = '.' 
-                     inper = '.'
-                     oin = '.'
-                     delper = dels/float(total_HQ)*100
-                     scan = []
-              
-                  aPer = Aa_HQ/float(total_HQ)*100
-                  tPer = Tt_HQ/float(total_HQ)*100
-                  cPer = Cc_HQ/float(total_HQ)*100
-                  gPer = Gg_HQ/float(total_HQ)*100
-                  matchPer = match_HQ/float(total_HQ)*100
-                  scan += [['A',aPer],['T',tPer],['C',cPer],['G',gPer],['*',delper]]
-                  for w in scan:
-                     if w[0] == refbase:
-                        w[1] += matchPer
-                  scan.sort(lambda x, y: cmp(float(y[1]),float(x[1])))
-                  scan2 = []
-                  for w in scan:
-                     if w[1] == 0.0:
-                        scan2.append('.')
-                     else:
-                        scan2.append(w[0]+'_'+form(w[1]))
-                  
-                  result+= [scan2[0], scan2[1], scan2[2], str(total_HQ)]
-               except ZeroDivisionError:
-                  result+=['.','.','.','.']
-      
-         ot.write('\t'.join(result)+'\n')         
-         #######    
-      ot.close()
-      f.close()
+    def __init__ (self, filen, res, startpos, endpos):
+        self.filen = filen
+        self.res = res
+        self.startpos = startpos
+        self.endpos = endpos
+        multiprocessing.Process.__init__ (self)
 
-      
+    def run (self):
+        sys.stderr.write("{} {}\n".format(self.startpos, self.endpos))
+        counter, ctgood = 1, 0
+        all_pos = self.endpos - self.startpos
+        with gzip.open('temp-parse-{}.txt.Z'.format(self.res), 'wt') as gzip_out, gzip.open(self.filen, 'rt') as gzip_in:
+            next(gzip_in)
+            for lcount, row in enumerate(gzip_in, start=1):
+                if lcount < self.startpos:
+                    continue
+                break
+            mpreader = csv.reader(gzip_in, delimiter='\t')
+            for lcount, row in enumerate(mpreader, start=lcount):
+                if lcount > self.endpos:
+                    break
+                if ctgood % 100008 == 0:
+                    sys.stderr.write("{} {}/{}\n".format(self.res, ctgood, all_pos))
+                ctgood += 1
+                result, refbase = row[:3], row[2]
+                samples = list(splitter(row[3:], 3))
+                for depth, changes, qualities in samples:
+                    try:
+                        # TODO: make sure that quals are phred33!
+                        mean_SQ = sum(map(lambda x: ord(x)-33, list(qualities))) / len(qualities)
+                    except ZeroDivisionError:
+                        mean_SQ = 0.0
+                    if mean_SQ < 20.0:
+                        result.extend(['.', '.', '.', '.'])
+                    else:
+                        inserts, quals = Counter(), Counter()
+                        valid = set(['a','A','c','C','g','G','t','T','.',',','*'])
+                        quals, inserts = scanChanges(changes, valid)
+                        total_HQ = sum(quals.values())
+                        Aa_HQ, Tt_HQ, Cc_HQ, Gg_HQ = quals['A'], quals['T'], quals['C'], quals['G']
+                        match_HQ = quals['.'] + quals[',']
+                        dels = quals['*']
+                        scan = list()
+
+                        if total_HQ == 0 and not inserts:
+                            result.extend(['.', '.', '.', '.'])
+                        else:
+                            if inserts:
+                                inname, incount = sorted(inserts.items(), key=lambda x:x[1], reverse=True)[0]
+                                inper = incount / float(incount + total_HQ) * 100
+                                delper = dels / float(incount + total_HQ) * 100
+                                oin = sum(inserts.values())
+                                total_HQ += oin
+                                scan.append([inname, inper])
+                            else:
+                                inname, inper, oin = '.', '.', '.'
+                                delper = dels / float(total_HQ) * 100
+
+                            aPer = Aa_HQ / float(total_HQ) * 100
+                            tPer = Tt_HQ / float(total_HQ) * 100
+                            cPer = Cc_HQ / float(total_HQ) * 100
+                            gPer = Gg_HQ / float(total_HQ) * 100
+                            matchPer = match_HQ / float(total_HQ) * 100
+                            scan.extend([['A',aPer],['T',tPer],['C',cPer],['G',gPer],['*',delper]])
+
+                            for w in scan:
+                               if w[0] == refbase:
+                                  w[1] += matchPer
+                                  break
+
+                            for w in sorted(scan, key=lambda x:x[1], reverse=True)[:3]:
+                               if w[1] == 0.0:
+                                  result.append('.')
+                               else:
+                                  result.append('{}_{}'.format(w[0], round(w[1], 2)))
+                            result.append(str(total_HQ))
+
+            gzip_out.write('{}\n'.format('\t'.join(result)))
+
+
 # Uses wc to get te number of lines in the file
 def file_len(fname):
     p = subprocess.Popen(['wc', '-l', fname], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -258,94 +174,75 @@ def file_len(fname):
     if p.returncode != 0:
         raise IOError(err)
     return int(result.strip().split()[0])
-    
-    
-     
 
 
+if __name__ == '__main__':
 
-      
-t1 =  datetime.datetime.now()      
-#print t1 
-try: 
-   filename = opt.file  
-   f = gzip.open(filename, 'r')
-   #o = open("parsed_"+filename.split('/')[-1],'w')
-except:
-   parser.error("Could not open input. Please check your command line paramters with -h or --help")
-flen = None
-if opt.in_len:
-    with open(opt.in_len, 'r') as l:
-        flen = int(l.readline().strip().split()[0])
-else:
-    flen = file_len(filename)
-cutnum = (flen-1)/numThreads+1
-cutset = []
-for i in range(numThreads):
-   cutset.append([i*cutnum+1, min((i+1)*cutnum, flen)])
- 
-header = f.readline()
-if header == '':
-   sys.exit("Empty pileup file")
-#f.seek(0)
-#header = f.readline()
-header =header[:-1].split('\t')
-h2 = list(splitter(header[3:],3))
-newhead = header[:3]
-libs = []
-for lab in h2:
-   lname = ('-'.join(lab[0].split('-')[1:]))
-   libs.append(lname)
-   newhead += ["SNP1-"+lname,"SNP2-"+lname,"SNP3-"+lname,"Cov-"+lname]
+    start = time.time()
 
-#o.write('\t'.join(newhead)+'\n')
-sys.stdout.write('\t'.join(newhead)+'\n')
-#o.close()
-f.close()
-#
-#a = []
-#for l in f:
-#   a.append(l)
-#
-#
-#gc.collect()
-counter = 0
-threads = {}
-cat = "zcat"
-sys.stderr.write("%s\n" % cutset)
-for x in cutset:
-   counter+=1
-   sys.stderr.write("%s" % counter)
-   threads[counter] = MyThread(filename, counter, x[0], x[1])
-   cat += " temp-parse-"+str(counter)+".txt"
-   threads[counter].start() 
-   #del(threads[counter].lines)
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--thread', '-t', dest='nthreads', type=int, default=1, help='How many threads to use during processing (DEFAULT == 1)')
+    ap.add_argument('--mpileup_file', '-f', help='Input mpileup file')
+    ap.add_argument('--length', '-l', dest='length_file', help='File containing length in lines of input mpileup')
+    args = ap.parse_args()
 
-#del(a)
-#gc.collect()
-   
-#f.close()
-#cat += " >> parsed_"+filename.split('/')[-1]
+    numThreads = args.nthreads
 
-all = []
+    t1 =  datetime.datetime.now()
 
-for x in range(1, counter+1):
-   threads[x].join()
-   sys.stderr.write("%s joined\n" % x)
-os.system(cat)
-os.system("rm -f temp-parse-*")  
+    try:
+       filename = args.mpileup_file
+       f = gzip.open(filename, 'rt')
+    except:
+       sys.stderr.write("Could not open input. Please check your command line parameters with -h or --help.\n")
+       sys.exit(1)
 
-#fin = open("parsed_"+filename.split('/')[-1])
-#fin.readline()
-#bases = 0
-# 
-#for l in fin:
-#   bases+=1
-#
-#fin.close()
+    flen = 0
+    if args.length_file:
+        try:
+            with open(args.length_file) as line_file:
+                flen = int(next(line_file).strip().split()[0])
+        except:
+            sys.stderr.write("Could not open linecount file. Falling back to counting lines myself.\n")
 
-#print "parsed_"+filename.split('/')[-1]
-#print "Bases:\t"+str(bases)
-now = time.time()-start
-sys.stderr.write("%s %s" % (int(now/60), int(now%60)))
+    if flen == 0:
+        flen = file_len(filename)
 
+    cutnum = (flen-1)/numThreads+1
+    cutset = [[i * cutnum + 1, min((i + 1) * cutnum, flen)] for i in range(numThreads)]
+
+    mpreader = csv.reader(f, delimiter='\t')
+    try:
+        header = next(mpreader)
+    except:
+        sys.exit("Empty pileup file")
+
+
+    h2 = list(splitter(header[3:],3))
+    newhead = header[:3]
+    libs = []
+    for lab in h2:
+        lname = ('-'.join(lab[0].split('-')[1:]))
+        libs.append(lname)
+        newhead += ["SNP1-{}".format(lname),"SNP2-{}".format(lname),"SNP3-{}".format(lname),"Cov-{}".format(lname)]
+
+    sys.stdout.write('\t'.join(newhead)+'\n')
+
+    threads = list()
+    cat = ["zcat"]
+    sys.stderr.write("{}\n".format(cutset))
+    for counter, x in enumerate(cutset, start=1):
+        sys.stderr.write("{}\n".format(counter))
+        threads.append(MyThread(filename, counter, x[0], x[1]))
+        cat.append("temp-parse-{}.txt.Z".format(counter))
+        threads[-1].start()
+
+    for counter, thread in enumerate(threads, start=1):
+        thread.join()
+        sys.stderr.write("{} joined\n".format(counter))
+    sys.stderr.write('{}\n'.format(cat))
+    os.system(' '.join(cat))
+    os.system("rm -f temp-parse-*")
+
+    now = time.time()-start
+    sys.stderr.write("{} {}".format(int(now/60), int(now%60)))

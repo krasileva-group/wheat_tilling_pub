@@ -1,4 +1,4 @@
-#! /usr/bin/env python2.6
+ #! /usr/bin/env python2.6
 
 import os, sys, math, datetime, gc, time
 import threading, multiprocessing
@@ -164,7 +164,7 @@ class MyThread (multiprocessing.Process):
                                   result.append('{}_{}'.format(w[0], round(w[1], 2)))
                             result.append(str(total_HQ))
 
-            gzip_out.write('{}\n'.format('\t'.join(result)))
+                gzip_out.write('{}\n'.format('\t'.join(result)))
 
 
 # Uses wc to get te number of lines in the file
